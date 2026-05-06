@@ -86,10 +86,15 @@ async function main(): Promise<void> {
     log(`Additional MCP server: ${name} (${serverConfig.command})`);
   }
 
+  const env = { ...process.env };
+  if (config.ollamaModel) {
+    env.OLLAMA_MODEL = config.ollamaModel;
+  }
+
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
     mcpServers,
-    env: { ...process.env },
+    env,
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
   });
 

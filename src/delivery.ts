@@ -30,9 +30,26 @@ import type { Session } from './types.js';
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
+// Max sessions draining in parallel. Single-user: 8 is well above typical active session count.
+const MAX_CONCURRENT_DELIVERIES = Math.max(1, parseInt(process.env.MAX_CONCURRENT_DELIVERIES || '8', 10));
 
 /** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
 const deliveryAttempts = new Map<string, number>();
+
+/**
+ * Run tasks with bounded parallelism. Avoids sequential blocking without
+ * overwhelming the DB or channel adapter with unbounded concurrency.
+ */
+async function runConcurrent<T>(items: T[], fn: (item: T) => Promise<void>, limit: number): Promise<void> {
+  const queue = [...items];
+  const workers = Array.from({ length: Math.min(limit, queue.length) }, async () => {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      if (item !== undefined) await fn(item).catch(() => {/* errors logged inside fn */});
+    }
+  });
+  await Promise.all(workers);
+}
 
 /**
  * Sessions whose outbound queue is currently being drained.
@@ -123,9 +140,9 @@ async function pollActive(): Promise<void> {
 
   try {
     const sessions = getRunningSessions();
-    for (const session of sessions) {
-      await deliverSessionMessages(session);
-    }
+    // Run deliveries in parallel (bounded) — not sequentially. A slow session
+    // previously blocked all others for the full duration of its drain.
+    await runConcurrent(sessions, deliverSessionMessages, MAX_CONCURRENT_DELIVERIES);
   } catch (err) {
     log.error('Active delivery poll error', { err });
   }
@@ -138,9 +155,7 @@ async function pollSweep(): Promise<void> {
 
   try {
     const sessions = getActiveSessions();
-    for (const session of sessions) {
-      await deliverSessionMessages(session);
-    }
+    await runConcurrent(sessions, deliverSessionMessages, MAX_CONCURRENT_DELIVERIES);
   } catch (err) {
     log.error('Sweep delivery poll error', { err });
   }

@@ -14,6 +14,7 @@ import type Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
+import { randomUUID } from 'crypto';
 import { isSafeAttachmentName } from './attachment-safety.js';
 import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
@@ -71,8 +72,15 @@ export function sessionDbPath(agentGroupId: string, sessionId: string): string {
 }
 
 function generateId(): string {
-  return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `sess-${randomUUID()}`;
 }
+
+/**
+ * Cache of session IDs that have already had their inbound.db schema migrated.
+ * Prevents calling migrateMessagesInTable() on every DB open in the hot path
+ * (active poll calls openInboundDb for every session every ~1s).
+ */
+const migratedSessions = new Set<string>();
 
 /**
  * Find or create a session for a messaging group + thread.
@@ -286,7 +294,11 @@ function extractAttachmentFiles(
 /** Open the inbound DB for a session (host reads/writes). */
 export function openInboundDb(agentGroupId: string, sessionId: string): Database.Database {
   const db = openInboundDbRaw(inboundDbPath(agentGroupId, sessionId));
-  migrateMessagesInTable(db);
+  // Only run migration once per session per process lifetime (Fix MEDIO-1).
+  if (!migratedSessions.has(sessionId)) {
+    migrateMessagesInTable(db);
+    migratedSessions.add(sessionId);
+  }
   return db;
 }
 
@@ -296,9 +308,13 @@ export function openOutboundDb(agentGroupId: string, sessionId: string): Databas
 }
 
 /**
- * Write a message directly to a session's outbound DB so the host delivery
- * loop picks it up. Used by the command gate to send denial responses
- * without waking a container.
+ * @deprecated CRÍTICO: This function writes to the container-owned outbound.db
+ * from the host process, violating the single-writer-per-file invariant.
+ * DO NOT ADD NEW CALLERS. Kept only for backward compatibility with external
+ * modules that may reference it. Core routing (router.ts) no longer uses this.
+ *
+ * Correct alternative: write a 'system' message to inbound.db via writeSessionMessage()
+ * and let the container produce the outbound response.
  */
 export function writeOutboundDirect(
   agentGroupId: string,
@@ -339,7 +355,7 @@ export function writeSystemResponse(
   result: Record<string, unknown>,
 ): void {
   writeSessionMessage(agentGroupId, sessionId, {
-    id: `sys-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id: `sys-resp-${randomUUID()}`,
     kind: 'system',
     timestamp: new Date().toISOString(),
     content: JSON.stringify({

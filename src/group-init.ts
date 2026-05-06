@@ -34,7 +34,7 @@ const DEFAULT_SETTINGS_JSON =
  * spawn by `composeGroupClaudeMd()` (see `claude-md-compose.ts`). Initial
  * per-group instructions (if provided) seed `CLAUDE.local.md`.
  */
-export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: string }): void {
+export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: string; provider?: string; ollamaModel?: string }): void {
   const initialized: string[] = [];
 
   // 1. groups/<folder>/ — group memory + working dir
@@ -56,7 +56,7 @@ export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: s
   // groups/<folder>/container.json — empty container config, replaces the
   // former agent_groups.container_config DB column. Self-modification flows
   // read and write this file directly.
-  if (initContainerConfig(group.folder)) {
+  if (initContainerConfig(group.folder, { provider: opts?.provider, ollamaModel: opts?.ollamaModel })) {
     initialized.push('container.json');
   }
 

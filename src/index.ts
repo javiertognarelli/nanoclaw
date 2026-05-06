@@ -57,7 +57,7 @@ import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
 import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
-  log.info('NanoClaw starting');
+  log.info('Locus starting');
 
   // 0. Circuit breaker — backoff on rapid restarts
   await enforceStartupBackoff();
@@ -163,12 +163,23 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
-  log.info('NanoClaw running');
+  log.info('Locus running');
 }
 
-/** Graceful shutdown. */
+/** Graceful shutdown with forced exit after timeout. */
 async function shutdown(signal: string): Promise<void> {
   log.info('Shutdown signal received', { signal });
+
+  // Force exit after 15s in case a callback or adapter teardown hangs.
+  // Without this, a stuck WebSocket/HTTP keep-alive can prevent termination
+  // indefinitely (e.g. Telegram long-poll, WhatsApp WS connection).
+  const SHUTDOWN_TIMEOUT_MS = 15_000;
+  const forceExit = setTimeout(() => {
+    log.error('Shutdown timeout exceeded — forcing exit', { timeoutMs: SHUTDOWN_TIMEOUT_MS });
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  forceExit.unref(); // Don't let this timer itself prevent exit in normal cases.
+
   for (const cb of getShutdownCallbacks()) {
     try {
       await cb();
@@ -182,9 +193,9 @@ async function shutdown(signal: string): Promise<void> {
     await teardownChannelAdapters();
   } finally {
     // Always reset on graceful shutdown — even if teardown threw, we got here
-    // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
-    // as one.
+    // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted.
     resetCircuitBreaker();
+    clearTimeout(forceExit);
     process.exit(0);
   }
 }

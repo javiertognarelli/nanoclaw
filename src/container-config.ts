@@ -37,8 +37,10 @@ export interface ContainerConfig {
   additionalMounts: AdditionalMountConfig[];
   /** Which skills to enable — array of skill names or "all" (default). */
   skills: string[] | 'all';
-  /** Agent provider name (e.g. "claude", "opencode"). Default: "claude". */
+  /** Agent provider name (e.g. "claude", "opencode", "ollama"). Default: "claude". */
   provider?: string;
+  /** Ollama model override for this agent group. Falls back to global env if unset. */
+  ollamaModel?: string;
   /** Agent group display name (used in transcript archiving). */
   groupName?: string;
   /** Assistant display name (used in system prompt / responses). */
@@ -83,6 +85,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       additionalMounts: raw.additionalMounts ?? [],
       skills: raw.skills ?? 'all',
       provider: raw.provider,
+      ollamaModel: raw.ollamaModel,
       groupName: raw.groupName,
       assistantName: raw.assistantName,
       agentGroupId: raw.agentGroupId,
@@ -122,9 +125,9 @@ export function updateContainerConfig(folder: string, mutate: (config: Container
  * Initialize an empty container.json for a group if one doesn't already
  * exist. Idempotent — used from `group-init.ts`.
  */
-export function initContainerConfig(folder: string): boolean {
+export function initContainerConfig(folder: string, overrides?: Partial<ContainerConfig>): boolean {
   const p = configPath(folder);
   if (fs.existsSync(p)) return false;
-  writeContainerConfig(folder, emptyConfig());
+  writeContainerConfig(folder, { ...emptyConfig(), ...overrides });
   return true;
 }

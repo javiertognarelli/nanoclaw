@@ -15,6 +15,7 @@ import {
   CONTAINER_INSTALL_LABEL,
   DATA_DIR,
   GROUPS_DIR,
+  MAX_CONCURRENT_CONTAINERS,
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
@@ -60,6 +61,12 @@ const activeContainers = new Map<string, { process: ChildProcess; containerName:
  */
 const wakePromises = new Map<string, Promise<void>>();
 
+/**
+ * Fix CRÍTICO-2: Queue for sessions waiting to spawn when the container cap
+ * is reached. Drained in FIFO order each time a container exits.
+ */
+const wakeQueue: Array<{ session: Session; resolve: () => void; reject: (e: unknown) => void }> = [];
+
 export function getActiveContainerCount(): number {
   return activeContainers.size;
 }
@@ -68,11 +75,28 @@ export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
 }
 
+/** Drain the wake queue after a container slot frees up. */
+function drainWakeQueue(): void {
+  while (wakeQueue.length > 0 && activeContainers.size < MAX_CONCURRENT_CONTAINERS) {
+    const next = wakeQueue.shift()!;
+    // Re-check: the session may have been woken by the sweep while queued.
+    if (activeContainers.has(next.session.id) || wakePromises.has(next.session.id)) {
+      next.resolve();
+      continue;
+    }
+    const promise = spawnContainer(next.session).finally(() => {
+      wakePromises.delete(next.session.id);
+      drainWakeQueue();
+    });
+    wakePromises.set(next.session.id, promise);
+    promise.then(next.resolve).catch(next.reject);
+  }
+}
+
 /**
- * Wake up a container for a session. If already running or mid-spawn, no-op
- * (the in-flight wake promise is reused).
- *
- * The container runs the v2 agent-runner which polls the session DB.
+ * Wake up a container for a session. If already running or mid-spawn, no-op.
+ * If the container cap is reached, the wake is queued and resolves when a
+ * slot becomes available (Fix CRÍTICO-2 — previously no cap was enforced).
  */
 export function wakeContainer(session: Session): Promise<void> {
   if (activeContainers.has(session.id)) {
@@ -84,8 +108,23 @@ export function wakeContainer(session: Session): Promise<void> {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
+
+  // Enforce cap: queue if at limit.
+  if (activeContainers.size >= MAX_CONCURRENT_CONTAINERS) {
+    log.warn('Container cap reached — queuing wake', {
+      sessionId: session.id,
+      active: activeContainers.size,
+      cap: MAX_CONCURRENT_CONTAINERS,
+      queued: wakeQueue.length + 1,
+    });
+    return new Promise<void>((resolve, reject) => {
+      wakeQueue.push({ session, resolve, reject });
+    });
+  }
+
   const promise = spawnContainer(session).finally(() => {
     wakePromises.delete(session.id);
+    drainWakeQueue();
   });
   wakePromises.set(session.id, promise);
   return promise;
@@ -121,7 +160,7 @@ async function spawnContainer(session: Session): Promise<void> {
   const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
 
   const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
-  const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
+  const containerName = `locus-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
@@ -424,7 +463,7 @@ async function buildContainerArgs(
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
   // Environment — only vars read by code we don't own.
-  // Everything NanoClaw-specific is in container.json (read by runner at startup).
+  // Everything Locus-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
@@ -493,6 +532,28 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
 
   if (aptPackages.length === 0 && npmPackages.length === 0) {
     throw new Error('No packages to install. Use install_packages first.');
+  }
+
+  // Fix ALTO-3: validate package names against a safe character allowlist
+  // before embedding them in the Dockerfile RUN command. apt/npm package names
+  // are [a-z0-9._+-] — anything outside that range is a shell injection vector.
+  const SAFE_PKG_RE = /^[a-zA-Z0-9][a-zA-Z0-9._+\-@/]*$/;
+  const validatePkgs = (pkgs: string[], type: string): void => {
+    for (const pkg of pkgs) {
+      if (!SAFE_PKG_RE.test(pkg)) {
+        throw new Error(`Unsafe ${type} package name rejected: "${pkg}". Only alphanumeric, '.', '_', '+', '-', '@', '/' are allowed.`);
+      }
+      if (pkg.length > 128) {
+        throw new Error(`${type} package name too long (max 128 chars): "${pkg.slice(0, 40)}…"`);
+      }
+    }
+  };
+  validatePkgs(aptPackages, 'apt');
+  validatePkgs(npmPackages, 'npm');
+
+  // Validate CONTAINER_IMAGE tag: must not contain shell metacharacters.
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._\-:/]*$/.test(CONTAINER_IMAGE)) {
+    throw new Error(`Unsafe CONTAINER_IMAGE value: "${CONTAINER_IMAGE}"`);
   }
 
   let dockerfile = `FROM ${CONTAINER_IMAGE}\nUSER root\n`;

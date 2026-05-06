@@ -297,6 +297,35 @@ async function main(): Promise<void> {
     }
   }
 
+  if (!skip.has('ollama')) {
+    p.log.message(
+      brandBody(
+        dimWrap(
+          'Locus uses Ollama to run local models for complete privacy and no API costs. The CONDUCTOR agent needs a default brain.',
+          4,
+        ),
+      ),
+    );
+    const ollamaChoice = ensureAnswer(
+      await brightSelect({
+        message: 'Which model should the CONDUCTOR use by default?',
+        options: [
+          { value: 'qwen3.5:14b', label: 'Qwen 3.5 (14B)', hint: 'recommended for 12GB+ VRAM — extremely capable' },
+          { value: 'gemma4:9b', label: 'Gemma 4 (9B)', hint: 'faster, fits in 8GB VRAM' },
+          { value: 'skip', label: 'Skip local model setup' },
+        ],
+      }),
+    ) as string;
+    setupLog.userInput('ollama_choice', ollamaChoice);
+    
+    if (ollamaChoice !== 'skip') {
+      const { runOllamaStep } = await import('./install-ollama.js');
+      await runOllamaStep(ollamaChoice);
+      writeEnvLine('OLLAMA_MODEL', ollamaChoice);
+      appendProviderImport('./ollama.js');
+    }
+  }
+
   if (!skip.has('auth')) {
     await runAuthStep();
   }

@@ -103,7 +103,7 @@ async function main(): Promise<void> {
       id: agId,
       name: args.agentName,
       folder,
-      agent_provider: null,
+      agent_provider: process.env.OLLAMA_MODEL ? 'ollama' : null,
       created_at: now,
     });
     ag = getAgentGroupByFolder(folder)!;
@@ -112,10 +112,13 @@ async function main(): Promise<void> {
     console.log(`Reusing agent group: ${ag.id} (${folder})`);
   }
   initGroupFilesystem(ag, {
+    provider: process.env.OLLAMA_MODEL ? 'ollama' : undefined,
+    ollamaModel: process.env.OLLAMA_MODEL,
     instructions:
-      `# ${args.agentName}\n\n` +
-      `You are ${args.agentName}, a personal NanoClaw agent for ${args.displayName}. ` +
-      'When the user first reaches out, introduce yourself briefly and invite them to chat. Keep replies concise.',
+      `# ${args.agentName} (CONDUCTOR)\n\n` +
+      `You are ${args.agentName}, the central scientific and administrative orchestrator of the Locus Agent OS for ${args.displayName}. ` +
+      'When the user first reaches out, introduce yourself briefly and invite them to chat. ' +
+      'Keep your replies concise and factual, prioritizing scientific accuracy. You have access to specialized sub-agents.',
   });
 
   // 3. CLI messaging group + wiring.

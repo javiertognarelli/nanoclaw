@@ -17,6 +17,7 @@
  * drops (no agent wired, no trigger match); the access gate writes rows
  * for policy refusals.
  */
+import { randomUUID } from 'crypto';
 import { getChannelAdapter } from './channels/channel-registry.js';
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -29,14 +30,15 @@ import {
 import { findSessionForAgent } from './db/sessions.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import { resolveSession, writeSessionMessage } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
+/** Collision-free ID using Node 20+ built-in UUID v4. */
 function generateId(): string {
-  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `msg-${randomUUID()}`;
 }
 
 /**
@@ -164,7 +166,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     // attention (the bot was addressed — @mention or DM). Plain chatter in
     // channels we merely sit in stays silent — no row, no DB writes.
     if (!isMention) return;
-    const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const mgId = `mg-${randomUUID()}`;
     mg = {
       id: mgId,
       channel_type: event.channelType,
@@ -354,10 +356,21 @@ function evaluateEngage(
     case 'pattern': {
       const pat = agent.engage_pattern ?? '.';
       if (pat === '.') return true;
+      // Guard against ReDoS: run the regex in a try/catch and impose a
+      // character-limit pre-check. Patterns from the DB are admin-controlled
+      // (single user) so catastrophic backtracking is unlikely, but malformed
+      // patterns still cause uncaught exceptions that crash the event loop.
+      if (pat.length > 500) {
+        log.warn('engage_pattern too long — skipping', { agentGroupId: agent.agent_group_id, patLen: pat.length });
+        return false;
+      }
+      // Limit input text length fed to the regex to avoid O(n²) backtracking
+      // on very long messages. 4KB is well above any realistic chat message.
+      const safeText = text.length > 4096 ? text.slice(0, 4096) : text;
       try {
-        return new RegExp(pat).test(text);
+        return new RegExp(pat, 'u').test(safeText);
       } catch {
-        // Bad regex: fail open so admin sees the agent responding + can fix.
+        // Bad regex: fail open so the admin sees the agent responding + can fix.
         return true;
       }
     }
@@ -416,13 +429,24 @@ async function deliverToAgent(
       return;
     }
     if (gate.action === 'deny') {
-      writeOutboundDirect(session.agent_group_id, session.id, {
-        id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        kind: 'chat',
+      // Fix CRÍTICO-3: write to inbound.db (host-owned) via writeSessionMessage,
+      // NOT to outbound.db. The old writeOutboundDirect violated the
+      // single-writer invariant by having the host write to the container-owned
+      // outbound.db. The deny message is now a system message in inbound.db;
+      // the agent-runner reads it and echoes it as a chat response.
+      writeSessionMessage(session.agent_group_id, session.id, {
+        id: `deny-${randomUUID()}`,
+        kind: 'system',
+        timestamp: new Date().toISOString(),
         platformId: deliveryAddr.platformId,
         channelType: deliveryAddr.channelType,
         threadId: deliveryAddr.threadId,
-        content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
+        content: JSON.stringify({
+          type: 'permission_denied',
+          command: gate.command,
+          text: `Permission denied: ${gate.command} requires admin access.`,
+        }),
+        trigger: 1,
       });
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
       return;
@@ -469,6 +493,7 @@ async function deliverToAgent(
  * after a retry). Namespace by agent_group_id to keep ids unique per session.
  */
 function messageIdForAgent(baseId: string | undefined, agentGroupId: string): string {
+  // Namespace by agent_group_id to keep ids unique per session in fan-out.
   const id = baseId && baseId.length > 0 ? baseId : generateId();
   return `${id}:${agentGroupId}`;
 }
