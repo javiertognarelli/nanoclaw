@@ -12,6 +12,8 @@ import './agents.js';
 import './self-mod.js';
 import './calendar.js';
 import './openalex.js';
+import './doc-writer.js';
+import './fetch-paper.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {
